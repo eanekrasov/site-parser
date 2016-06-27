@@ -1,0 +1,4 @@
+node_modules/
+.idea/
+data/database.sqlite
+data/raw/*.txt

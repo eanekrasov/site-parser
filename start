@@ -1,0 +1,306 @@
+#!/usr/bin/env node
+
+
+if (!String.prototype.startsWith) {
+    Object.defineProperty(String.prototype, 'startsWith', {
+        enumerable: false,
+        configurable: false,
+        writable: false,
+        value: function (searchString, position) {
+            position = position || 0;
+            return this.lastIndexOf(searchString, position) === position;
+        }
+    });
+}
+
+var cmd = require('commander'),
+    fs = require('fs'),
+    async = require('async'),
+    phantom = require('node-phantom'),
+    sequelize = require('sequelize'),
+    pkg = require('./package'),
+    db = new sequelize(pkg.settings.db.database, pkg.settings.db.username, pkg.settings.db.password, pkg.settings.db.settings),
+    sites = {
+        "https://my.timepad.ru": {
+            post: ".b-event__info .btn",
+            data: {
+                city: {
+                    selector: '.ep-3-pagesummary__place-city'
+                },
+                address: {
+                    selector: '.ep-3-pagesummary__place-adress'
+                }
+
+            },
+            infinite: {
+                selector: '.l-main__more-events-button a'
+            }
+        },
+        "https://afisha.yandex.ru": {
+            post: '.event__name .i-page__click',
+            data: {
+                title: {
+                    selector: '.event-heading__title'
+                },
+                html: {
+                    selector: '.content-event__main',
+                    attr: 'innerHTML'
+                }
+            },
+            infinite: {
+                selector: '.button-more'
+            }
+        },
+        "http://www.muzeon.ru": {
+            post: '.items-container a',
+            data: {
+                html: {
+                    selector: 'section.txt',
+                    attr: 'innerHTML'
+                }
+            },
+            next: {
+                selector: '.pagination .control[rel="next"]'
+            }
+        }
+    },
+    openPage = function (phantom, url, cb, done) {
+        var page;
+        async.waterfall([
+            phantom.createPage,
+            function (_page, callback) {
+                page = _page;
+                page.open(url, callback);
+            },
+            function (status, callback) {
+                if (status == 'success') {
+                    cb(page, callback);
+                } else {
+                    callback({
+                        status: status,
+                        url: url
+                    });
+                }
+            }
+        ], function (err, results) {
+            page.close();
+            if (err) console.log(err);
+            done(err, results);
+        });
+    },
+    parsePost = function (Queue, Data, db, phantom, site, url, callback) {
+        openPage(phantom, url, function (page, callback) {
+            page.evaluate(function (site) {
+                var value = {};
+                for (var key in site.data) if (site.data.hasOwnProperty(key)) {
+                    var el = document.querySelector(site.data[key].selector);
+                    value[key] = site.data[key].hasOwnProperty('attr') ? el[site.data[key].attr] : el.textContent;
+                }
+                return value;
+            }, callback, site);
+        }, function (err, data) {
+            if (err) return callback(err);
+
+            Data.findOne({where: {url: url}}).then(function (m) {
+                m.set('data', JSON.stringify(data));
+                fs.writeFile("data\\raw\\" + m.get('id') + '.txt', JSON.stringify(data), function (err) {
+                    m.save().then(function (m) {
+                        console.log('saved');
+                        callback();
+                    });
+                });
+            }).catch(function (err) {
+                Data.create({
+                    url: url,
+                    data: JSON.stringify(data)
+                }).then(function (m) {
+                    fs.writeFile("data\\" + m.get('id') + '.txt', JSON.stringify(data), function (err) {
+                        callback();
+                    });
+                });
+            });
+        });
+    },
+    parsePosts = function self(Queue, Data, db, phantom, url, recursive, callback) {
+        var site = null;
+        var siteKey = null;
+        for (var key in sites) {
+            if (url.startsWith(key)) {
+                site = sites[key];
+                siteKey = key;
+                break;
+            }
+        }
+        if (site == null) return callback({error: "site not found"});
+        openPage(phantom, url, function (page, callback) {
+            console.log('opened', url);
+            page.evaluate(function (site) {
+                NodeList.prototype.forEach = Array.prototype.forEach;
+                var el,
+                    items = [];
+                document.querySelectorAll(site.post).forEach(function (item) {
+                    items.push({
+                        title: item.title,
+                        href: item.href
+                    });
+                });
+                return {
+                    items: items,
+                    next: (site.hasOwnProperty('next') && site.next.hasOwnProperty('selector') && (el = document.querySelector(site.next.selector))) ? el.href : null
+                };
+            }, callback, site);
+        }, function (err, catalog) {
+            if (err) return callback(err);
+            if (catalog) {
+                async.series(catalog.items.map(function (item) {
+                    return function (callback) {
+                        Queue.create({
+                            url: item.href,
+                            type: 'post',
+                            site: siteKey
+                        })
+                            .then(function () {
+                                console.log('queued post', item.href);
+                                callback();
+                            })
+                            .catch(callback);
+                    }
+                }), function (err) {
+                    if (err) {
+                        console.log(err);
+                    }
+                    if (recursive && catalog.next !== null) {
+                        Queue.create({
+                            url: catalog.next,
+                            type: 'posts'
+                        })
+                            .then(function () {
+                                console.log('queued posts', catalog.next);
+                                callback(null, catalog);
+                            });
+                    } else {
+                        callback(null, catalog);
+                    }
+                });
+            } else {
+                callback({error: 'parsePosts got an empty result'});
+            }
+        });
+    };
+
+cmd.version(pkg.version, '-V, --version')
+    .option('-r, --recursive', 'Парсить все страницы рекурсивно')
+    .option('-c, --cron', 'Отложенные (неудавшиеся) задачи')
+    .parse(process.argv);
+
+var init = function (next) {
+    async.parallel({
+            db: function (callback) {
+                db.authenticate()
+                    .then(function () {
+                        callback(null, db);
+                    })
+                    .catch(function (err) {
+                        callback(err, db);
+                    });
+            },
+            phantom: function (callback) {
+                phantom.create(callback, {
+                    phantomPath: require('phantomjs-prebuilt').path,
+                    parameters: { // see http://phantomjs.org/api/command-line.html
+                        'load-images': false,
+                        'ignore-ssl-errors': true
+                    }
+                });
+            }
+        },
+        function (err, results) {
+            var db = results.db;
+            var phantom = results.phantom;
+
+            var Queue = db.define('queue', {
+                url: sequelize.STRING,
+                type: sequelize.STRING,
+                site: sequelize.STRING,
+            }, {
+                freezeTableName: true // Model tableName will be the same as the model name
+            });
+
+            var Data = db.define('data', {
+                url: {type: sequelize.STRING},
+                data: {type: sequelize.STRING}
+            }, {
+                freezeTableName: true
+            });
+
+            async.series([
+                function (callback) {
+                    Data.sync({force: false}).then(function () {
+                        callback(null);
+                    });
+                },
+                function (callback) {
+                    Queue.sync({force: false}).then(function () {
+                        callback(null);
+                    });
+                }
+            ], function (err) {
+                if (err) {
+                    console.log(err);
+                    phantom.exit();
+                    process.exit();
+                }
+
+                // Tables created
+
+                next(Queue, Data, db, phantom);
+            });
+        });
+};
+
+if (!!cmd.cron) {
+    init(function (Queue, Data, db, phantom) {
+        Queue.findAll({
+            order: '"createdAt" ASC'
+        }).then(function (data) {
+            async.series(
+                data.map(function (item) {
+                    return function (callback) {
+                        console.log('processing', item.get('type'), item.get('url'));
+                        switch (item.get('type')) {
+                            case 'post':
+                                parsePost(Queue, Data, db, phantom, sites[item.get('site')], item.get('url'), function (err, result) {
+                                    item.destroy().then(function (item) {
+                                        callback();
+                                    });
+                                });
+                                break;
+                            case 'posts':
+                                parsePosts(Queue, Data, db, phantom, item.get('url'), !!cmd.recursive, function (err, result) {
+                                    console.log('posts result', result);
+                                    callback();
+                                });
+                                break;
+                            default:
+                                callback();
+                        }
+                    }
+                }), function (err, results) {
+                    phantom.exit();
+                    process.exit();
+                });
+        }).catch(function (err) {
+            console.log('err', err);
+            phantom.exit();
+            process.exit();
+        });
+    });
+} else if (cmd.args.length == 1) {
+    init(function (Queue, Data, db, phantom) {
+        parsePosts(Queue, Data, db, phantom, cmd.args[0], !!cmd.recursive, function (err, result) {
+            //console.log('result', result);
+            phantom.exit();
+            process.exit();
+        });
+    });
+}
